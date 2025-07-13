@@ -4,7 +4,7 @@
 
 ## 功能特性
 
-- 支持多种仓库类型：Maven、PyPI、NPM、Docker、Go、APT 等
+- 支持多种仓库类型：Maven、PyPI、NPM、Go、APT 等
 - 可配置多个上游仓库源
 - 统一代理入口，简化开发环境配置
 
@@ -13,7 +13,6 @@
 - **Maven**：central、apache、google、jitpack、gradle-plugins、spring-plugins、spring-milestones、spring-snapshots
 - **PyPI**：official
 - **NPM**：official
-- **Docker**：dockerhub、ghcr
 - **Go**：official
 - **APT**：ubuntu、debian
 
@@ -62,7 +61,6 @@ node server.js
 - Gradle Plugins: <https://mirrors-cy.xihan.website/maven/gradle-plugins/>
 - PyPI: <https://mirrors-cy.xihan.website/pypi/official/>
 - NPM: <https://mirrors-cy.xihan.website/npm/official/>
-- DockerHub: <https://mirrors-cy.xihan.website/docker/dockerhub/>
 - Go: <https://mirrors-cy.xihan.website/go/official/>
 
 ## 目录结构

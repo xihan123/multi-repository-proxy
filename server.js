@@ -27,10 +27,6 @@ const repositories = {
     npm: {
         'official': 'https://registry.npmjs.org'
     },
-    docker: {
-        'dockerhub': 'https://registry-1.docker.io',
-        'ghcr': 'https://ghcr.io',
-    },
     go: {
         'official': 'https://proxy.golang.org'
     },
