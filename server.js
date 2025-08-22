@@ -1,8 +1,10 @@
-const express = require('express');
-const {Readable} = require('stream');
+const http = require('http');
+const {pipeline} = require('stream');
+const {URL} = require('url');
+const {Pool} = require('undici');
 
-const app = express();
-const port = process.env.PORT || 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const REQUEST_TIMEOUT_MS = 30_000; // per upstream request timeout
 
 const repositories = {
     maven: {
@@ -30,172 +32,83 @@ const repositories = {
     },
 };
 
+// Build pools per origin and store base path
+const pools = {}; // origin -> Pool
+const repoMeta = {}; // `${type}/${key}` -> { origin, basePath }
+
+for (const type of Object.keys(repositories)) {
+    for (const key of Object.keys(repositories[type])) {
+        const raw = repositories[type][key];
+        const u = new URL(raw);
+        const origin = `${u.protocol}//${u.host}`;
+        const basePath = u.pathname.replace(/\/$/, '');
+        if (!pools[origin]) {
+            pools[origin] = new Pool(origin, {
+                connections: 8,
+                pipelining: 1,
+            });
+        }
+        repoMeta[`${type}/${key}`] = {origin, basePath};
+    }
+}
+
 // Build prefix map for explicit routing
-function buildPrefixMap() {
-    const map = {};
-    for (const type of Object.keys(repositories)) {
-        for (const repoKey of Object.keys(repositories[type])) {
-            const prefix = `/${type}/${repoKey}/`;
-            map[prefix] = repositories[type][repoKey].replace(/\/$/, '');
-        }
-    }
-    return map;
+const prefixMap = {};
+for (const k of Object.keys(repoMeta)) {
+    const [type, repo] = k.split('/');
+    const prefix = `/${type}/${repo}/`;
+    prefixMap[prefix] = repoMeta[k];
 }
 
-const prefixMap = buildPrefixMap();
+// Hop-by-hop headers to remove when forwarding or returning
+const HOP_BY_HOP = new Set([
+    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'te', 'trailers', 'transfer-encoding', 'upgrade'
+]);
 
-// Logging middleware
-app.use((req, res, next) => {
-    console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
-    next();
-});
+function now() {
+    return new Date().toISOString();
+}
 
-// CORS preflight
-app.options('*', (req, res) => {
-    res.set({
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-        'Access-Control-Allow-Headers': 'Range, If-None-Match, If-Modified-Since, Content-Type, Accept, Authorization'
-    });
-    res.sendStatus(204);
-});
-
-// Main handler
-app.use(async (req, res) => {
-    try {
-        // Allow only GET/HEAD/OPTIONS
-        if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-            res.set('Allow', 'GET, HEAD, OPTIONS');
-            return res.status(405).send('Method Not Allowed');
-        }
-
-        // Use originalUrl to preserve path+query
-        let pathAndQuery = req.originalUrl || req.url || '/';
-        // Ensure pathAndQuery begins with '/'
-        if (!pathAndQuery.startsWith('/')) pathAndQuery = '/' + pathAndQuery;
-
-        // 1) explicit prefix routing
-        for (const prefix of Object.keys(prefixMap)) {
-            if (pathAndQuery.startsWith(prefix)) {
-                const upstreamBase = prefixMap[prefix];
-                const stripped = pathAndQuery.slice(prefix.length) || '/';
-                const target = upstreamBase + stripped;
-                return await proxyToUpstream(req, res, target);
-            }
-        }
-
-        // 2) heuristics: try to infer repository type
-        const heur = detectRepositoryByPath(pathAndQuery);
-        if (heur) {
-            if (heur.type === 'maven') {
-                // Try all maven upstreams in order
-                const upstreamList = Object.values(repositories.maven).map(u => u.replace(/\/$/, ''));
-                return await tryUpstreamsInOrder(req, res, upstreamList, pathAndQuery);
-            } else {
-                // single upstream for detected type: take the 'official' or fallback first entry
-                const repoMap = repositories[heur.type];
-                const first = repoMap[heur.repo] || repoMap[Object.keys(repoMap)[0]];
-                if (!first) return res.status(502).send('No upstream configured for detected repository type');
-                const target = first.replace(/\/$/, '') + pathAndQuery;
-                return await proxyToUpstream(req, res, target);
-            }
-        }
-
-        // If nothing matched, return 404 with hint
-        return res.status(404).send(`
-No explicit repository prefix found and unable to infer repository type from path.
-You can use explicit prefixes like:
-  /maven/central/...
-  /pypi/official/simple/...
-  /npm/official/...
-  /go/official/...
-  /apt/ubuntu/...
-
-Or place files/paths that match common patterns (e.g. .jar/.pom for maven).
-`);
-    } catch (err) {
-        console.error('Unhandled proxy error:', err);
-        return res.status(500).send('Internal Server Error');
-    }
-});
-
-// Attempts a list of upstream bases in order and returns the first successful (<400) response
-async function tryUpstreamsInOrder(req, res, bases, pathAndQuery) {
-    let lastError = null;
-    for (const base of bases) {
-        const target = base + pathAndQuery;
-        try {
-            const upstreamRes = await fetchWithForwardedHeaders(req, target);
-            if (upstreamRes.status < 400) {
-                return await streamResponseToClient(upstreamRes, res);
-            } else {
-                // keep last Response to possibly return useful info
-                lastError = upstreamRes;
-            }
-        } catch (err) {
-            lastError = err;
-        }
-    }
-
-    if (lastError instanceof Response) {
-        return await streamResponseToClient(lastError, res);
-    } else if (lastError) {
-        return res.status(502).send('Upstream fetch failed: ' + String(lastError));
-    } else {
-        return res.status(502).send('No upstream available');
+function copyHeaders(srcHeaders, setHeaderCb) {
+    for (const [name, value] of Object.entries(srcHeaders || {})) {
+        if (HOP_BY_HOP.has(name.toLowerCase())) continue;
+        setHeaderCb(name, value);
     }
 }
 
-async function proxyToUpstream(req, res, target) {
-    try {
-        const upstreamRes = await fetchWithForwardedHeaders(req, target);
-        return await streamResponseToClient(upstreamRes, res);
-    } catch (err) {
-        console.error('Fetch to upstream failed:', err);
-        return res.status(502).send('Fetch to upstream failed: ' + String(err));
-    }
-}
-
-// Detect repository type by path heuristics. Returns {type, repo?} or null
 function detectRepositoryByPath(path) {
     const lower = path.toLowerCase();
 
-    // Maven artifacts: typical file extensions and layout
-    if (/\.(jar|pom|aar|zip|war|ear|module|sources\.jar|javadoc\.jar)(?:$|\?)/i.test(path) ||
-        /^\/[a-z0-9_.-]+\/[a-z0-9_.-]+\/[0-9]+\//i.test(path) || // e.g. /com/google/guava/...
+    if (/\.(jar|pom|aar|zip|war|ear|module|sources\.jar|javadoc\.jar|asc|sha1|md5)(?:$|\?)/i.test(path) ||
+        /^\/[a-z0-9_.-]+\/[a-z0-9_.-]+\/[0-9]+\//i.test(path) ||
         /\/maven2\//i.test(path)) {
         return {type: 'maven'};
     }
 
-    // PyPI simple index
     if (lower.startsWith('/simple/') || lower.includes('/simple/')) {
         return {type: 'pypi', repo: 'official'};
     }
 
-    // NPM heuristics (scoped package or direct registry access)
-    if (lower.startsWith('/-/') || /\/@[^\/]+\/|^\/?[^\/]+$/.test(path) && lower.includes('-')) {
-        // This is a loose heuristic - prefer explicit prefix when possible
+    if (path.includes('/-/') || /\/@[^\/]+\/|^\/?[^\/]+$/.test(path) && path.includes('-')) {
         return {type: 'npm', repo: 'official'};
     }
-    if (path.includes('/-/') || path.includes('/package/')) {
+    if (path.includes('/package/') || path.startsWith('/-/')) {
         return {type: 'npm', repo: 'official'};
     }
 
-    // Go proxy heuristics (v1 protocol paths)
-    if (path.includes('/@v/') || path.includes('/@latest') || /^\/[^\/]+\/[^\/]+\/@v\//.test(path) || path.startsWith('/mod/')) {
+    if (path.includes('/@v/') || path.includes('/@latest') || path.startsWith('/mod/')) {
         return {type: 'go', repo: 'official'};
     }
 
-    // APT heuristics
     if (lower.includes('/dists/') || lower.includes('/pool/') || lower.endsWith('.deb')) {
-        return {type: 'apt', repo: 'ubuntu'}; // default to ubuntu; user can use explicit prefix to choose debian
+        return {type: 'apt', repo: 'ubuntu'};
     }
 
     return null;
 }
 
-// Build headers to forward to upstream
-function buildForwardHeaders(req) {
+function buildForwardHeaders(incomingHeaders) {
     const headers = {};
     const forwardList = [
         'range',
@@ -207,63 +120,217 @@ function buildForwardHeaders(req) {
         'accept-encoding'
     ];
     for (const name of forwardList) {
-        const val = req.headers[name];
-        if (val) headers[name] = val;
+        if (incomingHeaders[name]) headers[name] = incomingHeaders[name];
     }
-    // Add Via header
-    const viaVal = req.headers['via'] ? req.headers['via'] + ', ' : '';
-    headers['via'] = viaVal + 'express-multi-proxy';
+    headers.via = (incomingHeaders.via ? incomingHeaders.via + ', ' : '') + 'node-proxy';
     return headers;
 }
 
-// Perform fetch to upstream while forwarding relevant headers and method
-async function fetchWithForwardedHeaders(req, target) {
-    const init = {
-        method: req.method,
-        headers: buildForwardHeaders(req),
-        redirect: 'follow'
-    };
-    // GET/HEAD: no body. If needed in future, support other methods.
-    return await fetch(target, init);
+function joinPaths(basePath, requestPath) {
+    if (!basePath) return requestPath;
+    if (!requestPath || requestPath === '/') return basePath || '/';
+    return (basePath + (requestPath.startsWith('/') ? requestPath : '/' + requestPath));
 }
 
-// Stream upstream Response to the Express response, copying headers and status
-async function streamResponseToClient(upstreamRes, expressRes) {
-    // Set status
-    expressRes.status(upstreamRes.status);
-
-    // Copy headers, skipping hop-by-hop
-    upstreamRes.headers.forEach((value, name) => {
-        const lname = name.toLowerCase();
-        if (['transfer-encoding', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers', 'upgrade'].includes(lname)) {
-            return;
-        }
-        expressRes.setHeader(name, value);
+async function requestUpstream(pool, path, method, headers, abortSignal) {
+    return pool.request({
+        path,
+        method,
+        headers,
+        signal: abortSignal,
     });
+}
 
-    // Ensure CORS
-    expressRes.setHeader('Access-Control-Allow-Origin', '*');
+async function tryUpstreamsInOrder(req, res, upstreamList, requestPathAndQuery) {
+    let lastErr = null;
+    for (const meta of upstreamList) {
+        const pool = pools[meta.origin];
+        const fullPath = joinPaths(meta.basePath, requestPathAndQuery);
+        const headers = buildForwardHeaders(req.headers);
 
-    // If no body or HEAD, end
-    if (expressRes.req.method === 'HEAD' || upstreamRes.body == null) {
-        return expressRes.end();
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+        try {
+            console.log(now(), 'trying upstream', meta.origin, fullPath);
+            const {
+                statusCode,
+                headers: upstreamHeaders,
+                body
+            } = await requestUpstream(pool, fullPath, req.method, headers, controller.signal);
+            clearTimeout(timeout);
+
+            if (statusCode < 400) {
+                copyHeaders(upstreamHeaders, (name, value) => res.setHeader(name, value));
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                res.writeHead(statusCode);
+
+                if (req.method === 'HEAD' || !body) {
+                    return res.end();
+                }
+                return pipeline(body, res, (err) => {
+                    if (err) {
+                        console.error(now(), 'stream error while piping body:', err);
+                        try {
+                            if (!res.headersSent) res.writeHead(502);
+                        } catch (e) {
+                        }
+                        try {
+                            res.end();
+                        } catch (e) {
+                        }
+                    }
+                });
+            } else {
+                lastErr = {
+                    statusCode,
+                    headers: upstreamHeaders,
+                    message: `upstream ${meta.origin} returned ${statusCode}`
+                };
+            }
+        } catch (err) {
+            clearTimeout(timeout);
+            lastErr = err;
+        }
     }
 
-    // Stream body: support Node streams or Web Streams
-    if (upstreamRes.body && typeof upstreamRes.body.pipe === 'function') {
-        // Node stream
-        upstreamRes.body.pipe(expressRes);
-    } else if (upstreamRes.body && typeof upstreamRes.body.getReader === 'function') {
-        // Web ReadableStream -> convert
-        const nodeStream = Readable.fromWeb(upstreamRes.body);
-        nodeStream.pipe(expressRes);
+    if (lastErr && lastErr.statusCode) {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.writeHead(lastErr.statusCode);
+        return res.end(`Upstream returned ${lastErr.statusCode}`);
     } else {
-        // Fallback: buffer small responses
-        const buf = Buffer.from(await upstreamRes.arrayBuffer());
-        expressRes.send(buf);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.writeHead(502);
+        return res.end('All upstreams failed: ' + String(lastErr));
     }
 }
 
-app.listen(port, () => {
-    console.log(`Multi-repo proxy listening on port ${port}`);
+async function proxyToMeta(req, res, meta, requestPathAndQuery) {
+    const pool = pools[meta.origin];
+    const fullPath = joinPaths(meta.basePath, requestPathAndQuery);
+    const headers = buildForwardHeaders(req.headers);
+
+    console.log(now(), 'proxy -> origin=' + meta.origin, ' fullPath=' + fullPath);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+        const {
+            statusCode,
+            headers: upstreamHeaders,
+            body
+        } = await requestUpstream(pool, fullPath, req.method, headers, controller.signal);
+        clearTimeout(timeout);
+
+        copyHeaders(upstreamHeaders, (name, value) => res.setHeader(name, value));
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.writeHead(statusCode);
+
+        if (req.method === 'HEAD' || !body) return res.end();
+
+        return pipeline(body, res, (err) => {
+            if (err) {
+                console.error(now(), 'stream error while piping body:', err);
+                try {
+                    if (!res.headersSent) res.writeHead(502);
+                } catch (e) {
+                }
+                try {
+                    res.end();
+                } catch (e) {
+                }
+            }
+        });
+    } catch (err) {
+        clearTimeout(timeout);
+        console.error(now(), 'fetch error', err);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        if (err.name === 'AbortError') {
+            res.writeHead(504);
+            return res.end('Upstream request timed out');
+        }
+        res.writeHead(502);
+        return res.end('Upstream fetch failed: ' + String(err));
+    }
+}
+
+const server = http.createServer(async (req, res) => {
+    try {
+        const method = req.method.toUpperCase();
+        const originalUrl = req.url || '/';
+        console.log(now(), method, originalUrl);
+
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+            res.setHeader('Allow', 'GET, HEAD, OPTIONS');
+            res.writeHead(405);
+            return res.end('Method Not Allowed');
+        }
+
+        if (method === 'OPTIONS') {
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Range, If-None-Match, If-Modified-Since, Content-Type, Accept, Authorization');
+            res.writeHead(204);
+            return res.end();
+        }
+
+        const pathAndQuery = originalUrl.startsWith('/') ? originalUrl : '/' + originalUrl;
+
+        // explicit prefix routing
+        for (const prefix of Object.keys(prefixMap)) {
+            if (pathAndQuery.startsWith(prefix)) {
+                const meta = prefixMap[prefix];
+                // properly remove the prefix and ensure leading '/'
+                const rel = '/' + pathAndQuery.slice(prefix.length);
+                // rel is like '/com/google/...'
+                return await proxyToMeta(req, res, meta, rel);
+            }
+        }
+
+        // heuristics
+        const heur = detectRepositoryByPath(pathAndQuery);
+        if (heur) {
+            if (heur.type === 'maven') {
+                const ordered = [];
+                for (const key of Object.keys(repositories.maven)) {
+                    const meta = repoMeta[`maven/${key}`];
+                    if (meta) ordered.push(meta);
+                }
+                return await tryUpstreamsInOrder(req, res, ordered, pathAndQuery);
+            } else {
+                const repoKey = heur.repo || Object.keys(repositories[heur.type])[0];
+                const meta = repoMeta[`${heur.type}/${repoKey}`];
+                if (!meta) {
+                    res.writeHead(502);
+                    res.setHeader('Access-Control-Allow-Origin', '*');
+                    return res.end('No upstream configured for detected repository type');
+                }
+                return await proxyToMeta(req, res, meta, pathAndQuery);
+            }
+        }
+
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.writeHead(404);
+        return res.end(
+            `No explicit repository prefix found and unable to infer repository type from path.
+Use explicit prefixes such as:
+  /maven/central/...
+  /pypi/official/simple/...
+  /npm/official/...
+  /go/official/...
+  /apt/ubuntu/...
+`);
+    } catch (err) {
+        console.error(now(), 'unexpected error in request handler:', err);
+        try {
+            res.writeHead(500);
+            res.end('Internal Server Error');
+        } catch (e) {
+        }
+    }
+});
+
+server.listen(PORT, () => {
+    console.log(`${now()} High-performance proxy listening on port ${PORT}`);
 });

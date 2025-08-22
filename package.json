@@ -1,7 +1,7 @@
 {
   "name": "multi-repository-proxy",
   "version": "1.0.0",
-  "description": "多仓库镜像代理服务器 - 原生Node.js实现，零第三方依赖.",
+  "description": "多仓库镜像代理服务器 - Node.js实现.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -16,7 +16,10 @@
   "author": "xihan123 <srxqzxs@vip.qq.com>",
   "license": "MIT",
   "dependencies": {
-    "express": "^5.1.0"
+    "undici": "^7.14.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
   },
   "engines": {
     "node": ">=14.0.0"
