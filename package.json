@@ -15,8 +15,9 @@
   "keywords": [],
   "author": "xihan123 <srxqzxs@vip.qq.com>",
   "license": "MIT",
-  "dependencies": {},
-  "devDependencies": {},
+  "dependencies": {
+    "express": "^5.1.0"
+  },
   "engines": {
     "node": ">=14.0.0"
   },

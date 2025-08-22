@@ -1,15 +1,9 @@
-/**
- * 多仓库镜像代理服务（零依赖、原生 Node.js 实现）
- */
-const http = require('http');
-const https = require('https');
-const {parse: parseUrl} = require('url');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const zlib = require('zlib');
+const express = require('express');
+const {Readable} = require('stream');
 
-// ===== 仓库配置（多仓库支持） =====
+const app = express();
+const port = process.env.PORT || 3000;
+
 const repositories = {
     maven: {
         'central': 'https://repo1.maven.org/maven2',
@@ -36,379 +30,240 @@ const repositories = {
     },
 };
 
-// ===== 基本配置项 =====
-const PORT = process.env.PORT || 3000; // 服务端口
-const LOG_DIR = path.join(__dirname, 'logs');
-const BODY_LIMIT = 10 * 1024 * 1024; // 请求体最大10MB
-const REQUEST_TIMEOUT = 30_000; // 代理请求超时30秒
-const IS_PROD = process.env.NODE_ENV === 'production'; // 生产环境标志
-
-/**
- * 保证日志目录存在
- */
-function ensureLogDir() {
-    if (!fs.existsSync(LOG_DIR)) {
-        fs.mkdirSync(LOG_DIR);
+// Build prefix map for explicit routing
+function buildPrefixMap() {
+    const map = {};
+    for (const type of Object.keys(repositories)) {
+        for (const repoKey of Object.keys(repositories[type])) {
+            const prefix = `/${type}/${repoKey}/`;
+            map[prefix] = repositories[type][repoKey].replace(/\/$/, '');
+        }
     }
+    return map;
 }
 
-/**
- * 流式日志写入，分级 info/warn/error
- * @param {string} level 日志级别
- * @param {string} message 日志内容
- * @param {object} meta 额外元数据
- */
-function log(level, message, meta) {
-    if (IS_PROD) return; // 生产环境不写日志
-    ensureLogDir();
-    const logFile = path.join(LOG_DIR, `${level}.log`);
-    const time = new Date().toISOString();
-    const record = `[${time}] [${level}] ${message}${meta ? ' ' + JSON.stringify(meta) : ''}\n`;
-    fs.promises.appendFile(logFile, record).catch(() => {
+const prefixMap = buildPrefixMap();
+
+// Logging middleware
+app.use((req, res, next) => {
+    console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
+    next();
+});
+
+// CORS preflight
+app.options('*', (req, res) => {
+    res.set({
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+        'Access-Control-Allow-Headers': 'Range, If-None-Match, If-Modified-Since, Content-Type, Accept, Authorization'
     });
-}
+    res.sendStatus(204);
+});
 
-/**
- * 规范化路径，防止目录穿越攻击
- * @param {string} p 路径
- * @returns {string|null} 安全路径或null
- */
-function normalizePath(p) {
-    if (p.includes('..')) return null;
-    return p.replace(/\/+/g, '/');
-}
+// Main handler
+app.use(async (req, res) => {
+    try {
+        // Allow only GET/HEAD/OPTIONS
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+            res.set('Allow', 'GET, HEAD, OPTIONS');
+            return res.status(405).send('Method Not Allowed');
+        }
 
-/**
- * 返回JSON响应，带安全HTTP头
- * @param {http.ServerResponse} res 响应对象
- * @param {number} code 状态码
- * @param {object} obj 响应内容
- * @param {object} headers 额外HTTP头
- */
-function sendJSON(res, code, obj, headers = {}) {
-    const body = JSON.stringify(obj);
-    res.writeHead(code, Object.assign({
-        'Content-Type': 'application/json; charset=utf-8',
-        'X-Content-Type-Options': 'nosniff',
-        'Content-Security-Policy': "default-src 'none'",
-        'Content-Length': Buffer.byteLength(body),
-    }, headers));
-    res.end(body);
-}
+        // Use originalUrl to preserve path+query
+        let pathAndQuery = req.originalUrl || req.url || '/';
+        // Ensure pathAndQuery begins with '/'
+        if (!pathAndQuery.startsWith('/')) pathAndQuery = '/' + pathAndQuery;
 
-/**
- * 根据accept-encoding自动Gzip响应
- * @param {http.IncomingMessage} req 请求对象
- * @param {http.ServerResponse} res 响应对象
- * @param {stream.Readable} bodyStream 响应流
- */
-function gzipMaybe(req, res, bodyStream) {
-    if (/\bgzip\b/i.test(req.headers['accept-encoding'] || '')) {
-        res.setHeader('Content-Encoding', 'gzip');
-        const gz = zlib.createGzip();
-        bodyStream.pipe(gz).pipe(res);
+        // 1) explicit prefix routing
+        for (const prefix of Object.keys(prefixMap)) {
+            if (pathAndQuery.startsWith(prefix)) {
+                const upstreamBase = prefixMap[prefix];
+                const stripped = pathAndQuery.slice(prefix.length) || '/';
+                const target = upstreamBase + stripped;
+                return await proxyToUpstream(req, res, target);
+            }
+        }
+
+        // 2) heuristics: try to infer repository type
+        const heur = detectRepositoryByPath(pathAndQuery);
+        if (heur) {
+            if (heur.type === 'maven') {
+                // Try all maven upstreams in order
+                const upstreamList = Object.values(repositories.maven).map(u => u.replace(/\/$/, ''));
+                return await tryUpstreamsInOrder(req, res, upstreamList, pathAndQuery);
+            } else {
+                // single upstream for detected type: take the 'official' or fallback first entry
+                const repoMap = repositories[heur.type];
+                const first = repoMap[heur.repo] || repoMap[Object.keys(repoMap)[0]];
+                if (!first) return res.status(502).send('No upstream configured for detected repository type');
+                const target = first.replace(/\/$/, '') + pathAndQuery;
+                return await proxyToUpstream(req, res, target);
+            }
+        }
+
+        // If nothing matched, return 404 with hint
+        return res.status(404).send(`
+No explicit repository prefix found and unable to infer repository type from path.
+You can use explicit prefixes like:
+  /maven/central/...
+  /pypi/official/simple/...
+  /npm/official/...
+  /go/official/...
+  /apt/ubuntu/...
+
+Or place files/paths that match common patterns (e.g. .jar/.pom for maven).
+`);
+    } catch (err) {
+        console.error('Unhandled proxy error:', err);
+        return res.status(500).send('Internal Server Error');
+    }
+});
+
+// Attempts a list of upstream bases in order and returns the first successful (<400) response
+async function tryUpstreamsInOrder(req, res, bases, pathAndQuery) {
+    let lastError = null;
+    for (const base of bases) {
+        const target = base + pathAndQuery;
+        try {
+            const upstreamRes = await fetchWithForwardedHeaders(req, target);
+            if (upstreamRes.status < 400) {
+                return await streamResponseToClient(upstreamRes, res);
+            } else {
+                // keep last Response to possibly return useful info
+                lastError = upstreamRes;
+            }
+        } catch (err) {
+            lastError = err;
+        }
+    }
+
+    if (lastError instanceof Response) {
+        return await streamResponseToClient(lastError, res);
+    } else if (lastError) {
+        return res.status(502).send('Upstream fetch failed: ' + String(lastError));
     } else {
-        bodyStream.pipe(res);
+        return res.status(502).send('No upstream available');
     }
 }
 
-/**
- * 代理转发请求到目标仓库
- * @param {http.IncomingMessage} req 客户端请求对象
- * @param {http.ServerResponse} res 客户端响应对象
- * @param {string} type 仓库类型
- * @param {string} mirrorName 仓库镜像名称
- * @param {string} restPath 仓库下的路径
- * @param {boolean} isHead 是否为HEAD请求
- */
-function proxyRequest(req, res, type, mirrorName, restPath, isHead = false) {
-    const repoType = repositories[type];
-    if (!repoType) {
-        return sendJSON(res, 404, {error: '仓库类型不存在'});
+async function proxyToUpstream(req, res, target) {
+    try {
+        const upstreamRes = await fetchWithForwardedHeaders(req, target);
+        return await streamResponseToClient(upstreamRes, res);
+    } catch (err) {
+        console.error('Fetch to upstream failed:', err);
+        return res.status(502).send('Fetch to upstream failed: ' + String(err));
     }
-    const baseUrl = repoType[mirrorName];
-    if (!baseUrl) {
-        return sendJSON(res, 404, {error: '该仓库类型下镜像不存在'});
-    }
-    const safePath = normalizePath(restPath);
-    if (!safePath) {
-        return sendJSON(res, 400, {error: '路径非法'});
+}
+
+// Detect repository type by path heuristics. Returns {type, repo?} or null
+function detectRepositoryByPath(path) {
+    const lower = path.toLowerCase();
+
+    // Maven artifacts: typical file extensions and layout
+    if (/\.(jar|pom|aar|zip|war|ear|module|sources\.jar|javadoc\.jar)(?:$|\?)/i.test(path) ||
+        /^\/[a-z0-9_.-]+\/[a-z0-9_.-]+\/[0-9]+\//i.test(path) || // e.g. /com/google/guava/...
+        /\/maven2\//i.test(path)) {
+        return {type: 'maven'};
     }
 
-    // 拼接目标URL
-    const origQuery = parseUrl(req.url).query || '';
-    const baseParsed = parseUrl(baseUrl);
-    let targetPath = baseParsed.pathname.replace(/\/$/, '') + '/' + safePath.replace(/^\//, '');
-    const targetUrl = `${baseParsed.protocol}//${baseParsed.host}${targetPath}${origQuery ? '?' + origQuery : ''}`;
-    const isHttps = baseParsed.protocol === 'https:';
-    const mod = isHttps ? https : http;
-    const headers = Object.assign({}, req.headers);
-    delete headers['host'];
+    // PyPI simple index
+    if (lower.startsWith('/simple/') || lower.includes('/simple/')) {
+        return {type: 'pypi', repo: 'official'};
+    }
 
-    // 请求体大小限制
-    let bodySize = 0;
-    const reqBody = [];
-    let aborted = false;
+    // NPM heuristics (scoped package or direct registry access)
+    if (lower.startsWith('/-/') || /\/@[^\/]+\/|^\/?[^\/]+$/.test(path) && lower.includes('-')) {
+        // This is a loose heuristic - prefer explicit prefix when possible
+        return {type: 'npm', repo: 'official'};
+    }
+    if (path.includes('/-/') || path.includes('/package/')) {
+        return {type: 'npm', repo: 'official'};
+    }
 
-    req.on('data', chunk => {
-        bodySize += chunk.length;
-        if (bodySize > BODY_LIMIT) {
-            sendJSON(res, 413, {error: '请求体过大'});
-            req.destroy();
-            aborted = true;
-        } else {
-            reqBody.push(chunk);
+    // Go proxy heuristics (v1 protocol paths)
+    if (path.includes('/@v/') || path.includes('/@latest') || /^\/[^\/]+\/[^\/]+\/@v\//.test(path) || path.startsWith('/mod/')) {
+        return {type: 'go', repo: 'official'};
+    }
+
+    // APT heuristics
+    if (lower.includes('/dists/') || lower.includes('/pool/') || lower.endsWith('.deb')) {
+        return {type: 'apt', repo: 'ubuntu'}; // default to ubuntu; user can use explicit prefix to choose debian
+    }
+
+    return null;
+}
+
+// Build headers to forward to upstream
+function buildForwardHeaders(req) {
+    const headers = {};
+    const forwardList = [
+        'range',
+        'if-none-match',
+        'if-modified-since',
+        'accept',
+        'user-agent',
+        'authorization',
+        'accept-encoding'
+    ];
+    for (const name of forwardList) {
+        const val = req.headers[name];
+        if (val) headers[name] = val;
+    }
+    // Add Via header
+    const viaVal = req.headers['via'] ? req.headers['via'] + ', ' : '';
+    headers['via'] = viaVal + 'express-multi-proxy';
+    return headers;
+}
+
+// Perform fetch to upstream while forwarding relevant headers and method
+async function fetchWithForwardedHeaders(req, target) {
+    const init = {
+        method: req.method,
+        headers: buildForwardHeaders(req),
+        redirect: 'follow'
+    };
+    // GET/HEAD: no body. If needed in future, support other methods.
+    return await fetch(target, init);
+}
+
+// Stream upstream Response to the Express response, copying headers and status
+async function streamResponseToClient(upstreamRes, expressRes) {
+    // Set status
+    expressRes.status(upstreamRes.status);
+
+    // Copy headers, skipping hop-by-hop
+    upstreamRes.headers.forEach((value, name) => {
+        const lname = name.toLowerCase();
+        if (['transfer-encoding', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers', 'upgrade'].includes(lname)) {
+            return;
         }
+        expressRes.setHeader(name, value);
     });
-    req.on('end', () => {
-        if (aborted) return;
-        const proxyOptions = {
-            protocol: baseParsed.protocol,
-            hostname: baseParsed.hostname,
-            port: baseParsed.port,
-            path: targetPath + (origQuery ? '?' + origQuery : ''),
-            method: isHead ? 'HEAD' : req.method,
-            headers,
-            timeout: REQUEST_TIMEOUT,
-        };
-        log('info', '代理转发请求', {type, mirrorName, path: safePath, method: proxyOptions.method});
 
-        const proxy = mod.request(proxyOptions, proxyRes => {
-            // 设置安全头
-            res.setHeader('X-Content-Type-Options', 'nosniff');
-            res.setHeader('Content-Security-Policy', "default-src 'none'");
-            // 透传响应头部（排除content-length，gzip后长度变化）
-            for (const [k, v] of Object.entries(proxyRes.headers)) {
-                if (k === 'content-length') continue;
-                res.setHeader(k, v);
-            }
-            if (isHead) {
-                // HEAD只返回头部不返回正文
-                return res.end();
-            }
-            gzipMaybe(req, res, proxyRes);
-        });
+    // Ensure CORS
+    expressRes.setHeader('Access-Control-Allow-Origin', '*');
 
-        proxy.on('timeout', () => {
-            proxy.destroy();
-            sendJSON(res, 504, {error: '代理请求超时'});
-            log('warn', '代理超时', {targetUrl});
-        });
-        proxy.on('error', err => {
-            sendJSON(res, 502, {error: '代理请求异常', detail: err.message});
-            log('error', '代理请求异常', {error: err.message, targetUrl});
-        });
+    // If no body or HEAD, end
+    if (expressRes.req.method === 'HEAD' || upstreamRes.body == null) {
+        return expressRes.end();
+    }
 
-        // 仅对有请求体的方法转发body
-        if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
-            for (const chunk of reqBody) proxy.write(chunk);
-        }
-        proxy.end();
-    });
+    // Stream body: support Node streams or Web Streams
+    if (upstreamRes.body && typeof upstreamRes.body.pipe === 'function') {
+        // Node stream
+        upstreamRes.body.pipe(expressRes);
+    } else if (upstreamRes.body && typeof upstreamRes.body.getReader === 'function') {
+        // Web ReadableStream -> convert
+        const nodeStream = Readable.fromWeb(upstreamRes.body);
+        nodeStream.pipe(expressRes);
+    } else {
+        // Fallback: buffer small responses
+        const buf = Buffer.from(await upstreamRes.arrayBuffer());
+        expressRes.send(buf);
+    }
 }
 
-/**
- * 处理HEAD请求，只返回响应头部
- * @param {http.IncomingMessage} req 请求对象
- * @param {http.ServerResponse} res 响应对象
- */
-function handleHeadRoute(req, res) {
-    const {pathname} = parseUrl(req.url);
-    const segments = pathname.replace(/^\/+|\/+$/g, '').split('/');
-    if (pathname === '/' || pathname === '') {
-        // 服务说明
-        const obj = {
-            service: '多仓库镜像代理服务',
-            version: '1.0',
-            repositories: Object.entries(repositories).map(([type, mirrors]) => ({
-                type,
-                mirrors: Object.keys(mirrors)
-            })),
-            usage: '/{type}/{mirrorName}/{path}',
-            health: '/health',
-            repos: '/repositories'
-        };
-        const body = JSON.stringify(obj);
-        res.writeHead(200, {
-            'Content-Type': 'application/json; charset=utf-8',
-            'X-Content-Type-Options': 'nosniff',
-            'Content-Security-Policy': "default-src 'none'",
-            'Content-Length': Buffer.byteLength(body),
-        });
-        return res.end();
-    }
-    if (pathname === '/health') {
-        // 健康检查
-        const obj = {
-            status: 'ok',
-            uptime: process.uptime(),
-            memory: process.memoryUsage(),
-            load: os.loadavg(),
-            timestamp: Date.now(),
-        };
-        const body = JSON.stringify(obj);
-        res.writeHead(200, {
-            'Content-Type': 'application/json; charset=utf-8',
-            'X-Content-Type-Options': 'nosniff',
-            'Content-Security-Policy': "default-src 'none'",
-            'Content-Length': Buffer.byteLength(body),
-        });
-        return res.end();
-    }
-    if (pathname === '/repositories') {
-        // 仓库类型列表
-        const obj = {
-            repositories: Object.entries(repositories).map(([type, mirrors]) => ({
-                type,
-                mirrors: Object.keys(mirrors)
-            }))
-        };
-        const body = JSON.stringify(obj);
-        res.writeHead(200, {
-            'Content-Type': 'application/json; charset=utf-8',
-            'X-Content-Type-Options': 'nosniff',
-            'Content-Security-Policy': "default-src 'none'",
-            'Content-Length': Buffer.byteLength(body),
-        });
-        return res.end();
-    }
-    if (segments.length === 1 && repositories[segments[0]]) {
-        // 单一仓库类型详情
-        const obj = {
-            type: segments[0],
-            mirrors: repositories[segments[0]]
-        };
-        const body = JSON.stringify(obj);
-        res.writeHead(200, {
-            'Content-Type': 'application/json; charset=utf-8',
-            'X-Content-Type-Options': 'nosniff',
-            'Content-Security-Policy': "default-src 'none'",
-            'Content-Length': Buffer.byteLength(body),
-        });
-        return res.end();
-    }
-    if (segments.length >= 2 && repositories[segments[0]] && repositories[segments[0]][segments[1]]) {
-        // 仓库文件HEAD透传
-        const [type, mirrorName, ...rest] = segments;
-        const restPath = rest.join('/');
-        if (!restPath) {
-            const body = JSON.stringify({error: '镜像名后必须跟具体路径'});
-            res.writeHead(400, {
-                'Content-Type': 'application/json; charset=utf-8',
-                'Content-Length': Buffer.byteLength(body),
-                'X-Content-Type-Options': 'nosniff',
-                'Content-Security-Policy': "default-src 'none'",
-            });
-            return res.end();
-        }
-        // 发起到上游的HEAD请求
-        return proxyRequest(req, res, type, mirrorName, restPath, true);
-    }
-    // 未命中返回404
-    const body = JSON.stringify({error: '未找到对应资源'});
-    res.writeHead(404, {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Content-Length': Buffer.byteLength(body),
-        'X-Content-Type-Options': 'nosniff',
-        'Content-Security-Policy': "default-src 'none'",
-    });
-    return res.end();
-}
-
-/**
- * 处理常规路由（GET/POST/PUT/PATCH）
- * @param {http.IncomingMessage} req 请求对象
- * @param {http.ServerResponse} res 响应对象
- */
-function handleRoute(req, res) {
-    const {pathname} = parseUrl(req.url);
-    const segments = pathname.replace(/^\/+|\/+$/g, '').split('/');
-    if (pathname === '/' || pathname === '') {
-        // 服务说明
-        return sendJSON(res, 200, {
-            service: '多仓库镜像代理服务',
-            version: '1.0',
-            repositories: Object.entries(repositories).map(([type, mirrors]) => ({
-                type,
-                mirrors: Object.keys(mirrors)
-            })),
-            usage: '/{type}/{mirrorName}/{path}',
-            health: '/health',
-            repos: '/repositories'
-        });
-    }
-    if (pathname === '/health') {
-        // 健康检查
-        return sendJSON(res, 200, {
-            status: 'ok',
-            uptime: process.uptime(),
-            memory: process.memoryUsage(),
-            load: os.loadavg(),
-            timestamp: Date.now(),
-        });
-    }
-    if (pathname === '/repositories') {
-        // 仓库类型列表
-        return sendJSON(res, 200, {
-            repositories: Object.entries(repositories).map(([type, mirrors]) => ({
-                type,
-                mirrors: Object.keys(mirrors)
-            }))
-        });
-    }
-    if (segments.length === 1 && repositories[segments[0]]) {
-        // 单一仓库类型详情
-        return sendJSON(res, 200, {
-            type: segments[0],
-            mirrors: repositories[segments[0]]
-        });
-    }
-    if (segments.length >= 2 && repositories[segments[0]] && repositories[segments[0]][segments[1]]) {
-        // 代理转发到具体仓库
-        const [type, mirrorName, ...rest] = segments;
-        const restPath = rest.join('/');
-        if (!restPath) {
-            return sendJSON(res, 400, {error: '镜像名后必须跟具体路径'});
-        }
-        return proxyRequest(req, res, type, mirrorName, restPath);
-    }
-    // 未命中返回404
-    sendJSON(res, 404, {error: '未找到对应资源'});
-}
-
-/**
- * 优雅关闭服务，处理SIGTERM/SIGINT信号
- * @param {http.Server} server 服务实例
- */
-function gracefulShutdown(server) {
-    log('info', '服务正在优雅退出...', {});
-    server.close(() => process.exit(0));
-}
-
-// 全局异常处理，保证日志落盘
-process.on('uncaughtException', err => {
-    log('error', '未捕获异常', {error: err.stack});
-    process.exit(1);
+app.listen(port, () => {
+    console.log(`Multi-repo proxy listening on port ${port}`);
 });
-process.on('unhandledRejection', err => {
-    log('error', 'Promise未处理拒绝', {error: err && err.stack || err});
-    process.exit(1);
-});
-
-// ===== 启动HTTP服务，支持HEAD方法 =====
-const server = http.createServer((req, res) => {
-    // 仅允许部分HTTP方法
-    if (!['GET', 'POST', 'PUT', 'PATCH', 'HEAD'].includes(req.method)) {
-        return sendJSON(res, 405, {error: '不支持的HTTP方法'});
-    }
-    if (req.method === 'HEAD') {
-        return handleHeadRoute(req, res);
-    }
-    handleRoute(req, res);
-});
-server.listen(PORT, () => {
-    log('info', `镜像代理服务启动于端口${PORT}`, {});
-    console.log(`镜像代理服务启动于端口${PORT}`);
-});
-process.on('SIGTERM', () => gracefulShutdown(server));
-process.on('SIGINT', () => gracefulShutdown(server));
