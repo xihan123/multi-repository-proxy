@@ -18,6 +18,9 @@ WORKDIR /app
 COPY server.js .
 COPY package.json .
 
+# 安装 undici 依赖
+RUN npm install
+
 # 创建日志目录
 RUN mkdir -p logs
 
